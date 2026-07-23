@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build
+
+
+  # Assemble the real .app on every push and PR, not just on a release. A
+  # passing `swift build` says nothing about whether make-app.sh still works —
+  # icon generation, the Info.plist, and ad-hoc signing are only exercised
+  # here, and a break in any of them would otherwise surface for the first
+  # time halfway through cutting a release.
+  app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app bundle
+        run: VERSION="0.0.0-${GITHUB_SHA:0:7}" ./make-app.sh --dist
+
+      - name: Verify the bundle is well formed
+        run: |
+          set -euo pipefail
+          APP=dist/Sextant.app
+          test -x "$APP/Contents/MacOS/Sextant"
+          test -f "$APP/Contents/Resources/AppIcon.icns"
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Verify the disk image
+        run: |
+          set -euo pipefail
+          hdiutil attach dist/Sextant-*.dmg -nobrowse -quiet -mountpoint /tmp/dmg
+          test -x /tmp/dmg/Sextant.app/Contents/MacOS/Sextant
+          test -L /tmp/dmg/Applications   # the drag-to-install alias
+          hdiutil detach /tmp/dmg -quiet
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sextant-${{ github.sha }}
+          path: |
+            dist/Sextant-*.dmg
+            dist/Sextant-*.zip
+          retention-days: 14
+          if-no-files-found: error

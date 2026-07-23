@@ -1,0 +1,85 @@
+name: Release
+
+# The VERSION file is the trigger. Bump it in an ordinary commit, push, and
+# this cuts the release: tag, universal build, .zip + .dmg, GitHub release.
+# Push anything that doesn't change VERSION and this job checks, finds the
+# release already exists, and stops. No bot commits, no tags to remember.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the VERSION file
+        id: v
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Has this version already shipped?
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.v.outputs.version }}" >/dev/null 2>&1; then
+            echo "v${{ steps.v.outputs.version }} is already released — nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v${{ steps.v.outputs.version }} is new — building."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build universal app, zip and disk image
+        if: steps.gate.outputs.publish == 'true'
+        run: VERSION="${{ steps.v.outputs.version }}" ./make-app.sh --dist
+
+      - name: Verify the disk image
+        if: steps.gate.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          V="${{ steps.v.outputs.version }}"
+          DMG="dist/Sextant-${V}.dmg"
+          test -f "$DMG"
+          # Both architectures, or the download is broken for every Intel Mac.
+          lipo -archs dist/Sextant.app/Contents/MacOS/Sextant | tee /dev/stderr | grep -q x86_64
+          lipo -archs dist/Sextant.app/Contents/MacOS/Sextant | grep -q arm64
+          # Mount it the way a downloader would and confirm the drag-to-install
+          # layout survived packaging: the app plus an /Applications alias.
+          hdiutil attach "$DMG" -nobrowse -quiet -mountpoint /tmp/dmg
+          test -x /tmp/dmg/Sextant.app/Contents/MacOS/Sextant
+          test -L /tmp/dmg/Applications
+          codesign --verify --deep --strict /tmp/dmg/Sextant.app
+          hdiutil detach /tmp/dmg -quiet
+
+      - name: Publish the release
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="${{ steps.v.outputs.version }}"
+          gh release create "v$V" \
+            dist/Sextant-*.dmg dist/Sextant-*.zip \
+            --target "$GITHUB_SHA" \
+            --title "Sextant v$V" \
+            --notes-file - <<NOTES
+          A tiny menu bar utility for measuring, aligning, and reading the screen: a fullscreen crosshair through your pointer, a circular pixel loupe beside it, a ruler you drag across any two points, sticky guides, a layout grid, and a freeze that holds a menu still while you take your sight.
+
+          **Install:** download the \`.dmg\`, open it, and drag \`Sextant.app\` to the
+          \`Applications\` folder beside it. (The \`.zip\` is the same app, if you
+          prefer it.) Universal — Apple Silicon and Intel, macOS 14+.
+
+          Sextant is ad-hoc signed rather than notarized, so macOS quarantines it
+          on download. Open it once via **System Settings → Privacy & Security →
+          Open Anyway**, or clear the flag yourself:
+
+          \`\`\`
+          xattr -d com.apple.quarantine /Applications/Sextant.app
+          \`\`\`
+          NOTES
