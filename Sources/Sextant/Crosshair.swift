@@ -1,14 +1,27 @@
 import AppKit
 
-/// Fullscreen click-through hairlines that track the pointer across every screen.
-/// Needs no permissions at all: the overlay windows ignore mouse events and the
-/// pointer is read via NSEvent monitors + NSEvent.mouseLocation.
+/// The click-through drawing layer: hairlines that track the pointer, sticky
+/// guides, and the layout grid. All three share one set of fullscreen overlay
+/// windows so they stack in a predictable order and cost one window per screen.
+///
+/// Needs no permissions at all: the windows ignore mouse events and the pointer
+/// is read via NSEvent monitors + NSEvent.mouseLocation.
 @MainActor
 final class CrosshairController: NSObject, ObservableObject {
+    /// The hairlines through the pointer.
     @Published var isActive = false {
         didSet {
             guard oldValue != isActive else { return }
-            if isActive { activate() } else { deactivate() }
+            syncWindows()
+            if isActive { startTracking() } else { stopTracking() }
+        }
+    }
+
+    /// The column / baseline grid.
+    @Published var showGrid = false {
+        didSet {
+            guard oldValue != showGrid else { return }
+            syncWindows()
         }
     }
 
@@ -17,12 +30,14 @@ final class CrosshairController: NSObject, ObservableObject {
     var onWindowsChanged: (() -> Void)?
 
     private let settings: SettingsStore
+    private let guides: GuideStore
     private var windows: [OverlayWindow] = []
     private var globalMonitor: Any?
     private var localMonitor: Any?
 
-    init(settings: SettingsStore) {
+    init(settings: SettingsStore, guides: GuideStore) {
         self.settings = settings
+        self.guides = guides
         super.init()
         NotificationCenter.default.addObserver(
             self, selector: #selector(screensChanged),
@@ -32,10 +47,34 @@ final class CrosshairController: NSObject, ObservableObject {
             name: .sextantSettingsChanged, object: nil)
     }
 
+    /// True when anything at all wants to be on screen.
+    private var wantsWindows: Bool {
+        isActive || showGrid || !guides.isEmpty
+    }
+
+    /// Call after guides change so the overlay appears, disappears, or redraws.
+    func guidesChanged() {
+        syncWindows()
+        redraw()
+    }
+
     // MARK: - Lifecycle
 
-    private func activate() {
-        rebuildWindows()
+    private func syncWindows() {
+        if wantsWindows {
+            if windows.isEmpty {
+                rebuildWindows()
+                onWindowsChanged?()
+            }
+            update()
+        } else if !windows.isEmpty {
+            for window in windows { window.orderOut(nil) }
+            windows.removeAll()
+            onWindowsChanged?()
+        }
+    }
+
+    private func startTracking() {
         let events: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged,
                                              .rightMouseDragged, .otherMouseDragged]
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: events) { [weak self] _ in
@@ -46,23 +85,20 @@ final class CrosshairController: NSObject, ObservableObject {
             return event
         }
         update()
-        onWindowsChanged?()
     }
 
-    private func deactivate() {
+    private func stopTracking() {
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
         globalMonitor = nil
         localMonitor = nil
-        for window in windows { window.orderOut(nil) }
-        windows.removeAll()
-        onWindowsChanged?()
     }
 
     private func rebuildWindows() {
         for window in windows { window.orderOut(nil) }
         windows = NSScreen.screens.map { screen in
-            let window = OverlayWindow(screen: screen, settings: settings)
+            let window = OverlayWindow(screen: screen, settings: settings, guides: guides,
+                                       controller: self)
             window.orderFrontRegardless()
             return window
         }
@@ -71,41 +107,53 @@ final class CrosshairController: NSObject, ObservableObject {
     // MARK: - Events
 
     @objc private func screensChanged(_ note: Notification) {
-        guard isActive else { return }
+        guard !windows.isEmpty else { return }
         rebuildWindows()
         update()
         onWindowsChanged?()
     }
 
     @objc private func settingsChanged(_ note: Notification) {
-        guard isActive else { return }
-        update()
+        redraw()
+    }
+
+    private func redraw() {
+        for window in windows { window.contentView?.needsDisplay = true }
     }
 
     private func update() {
-        let location = NSEvent.mouseLocation
+        var location = NSEvent.mouseLocation
+        if settings.snapToGuides {
+            location = guides.snapped(location, within: 6)
+        }
         for window in windows {
-            (window.contentView as? CrosshairView)?.pointerMoved(to: location)
+            (window.contentView as? OverlayView)?.pointerMoved(to: location)
         }
     }
+
+    /// Whether the hairlines should draw — the view asks, because the same
+    /// window also carries the grid and guides.
+    var drawsCrosshair: Bool { isActive }
+    var drawsGrid: Bool { showGrid }
 }
 
 // MARK: - Window
 
 private final class OverlayWindow: NSWindow {
-    init(screen: NSScreen, settings: SettingsStore) {
+    init(screen: NSScreen, settings: SettingsStore, guides: GuideStore,
+         controller: CrosshairController) {
         super.init(contentRect: screen.frame, styleMask: .borderless,
                    backing: .buffered, defer: false)
         isOpaque = false
         backgroundColor = .clear
         hasShadow = false
         ignoresMouseEvents = true
-        level = .screenSaver
+        level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary,
                               .stationary, .ignoresCycle]
         isReleasedWhenClosed = false
-        contentView = CrosshairView(frame: NSRect(origin: .zero, size: screen.frame.size),
-                                    settings: settings)
+        contentView = OverlayView(frame: NSRect(origin: .zero, size: screen.frame.size),
+                                  settings: settings, guides: guides, controller: controller)
     }
 
     override var canBecomeKey: Bool { false }
@@ -114,12 +162,17 @@ private final class OverlayWindow: NSWindow {
 
 // MARK: - View
 
-private final class CrosshairView: NSView {
+private final class OverlayView: NSView {
     private let settings: SettingsStore
+    private let guides: GuideStore
+    private unowned let controller: CrosshairController
     private var pointer = NSPoint(x: -10_000, y: -10_000) // global coords
 
-    init(frame: NSRect, settings: SettingsStore) {
+    init(frame: NSRect, settings: SettingsStore, guides: GuideStore,
+         controller: CrosshairController) {
         self.settings = settings
+        self.guides = guides
+        self.controller = controller
         super.init(frame: frame)
     }
 
@@ -132,18 +185,117 @@ private final class CrosshairView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let windowFrame = window?.frame,
-              NSMouseInRect(pointer, windowFrame, false) else { return }
+        if controller.drawsGrid { drawGrid() }
+        drawGuides()
+        if controller.drawsCrosshair { drawCrosshair() }
+    }
 
-        let local = NSPoint(x: pointer.x - windowFrame.minX,
-                            y: pointer.y - windowFrame.minY)
+    /// Window frame in global coordinates — everything is drawn relative to it.
+    private var windowFrame: NSRect { window?.frame ?? .zero }
+
+    // MARK: Grid
+
+    private func drawGrid() {
+        let columns = max(1, settings.gridColumns)
+        let gutter = max(0, CGFloat(settings.gridGutter))
+        let margin = max(0, CGFloat(settings.gridMargin))
+        let color = settings.gridNSColor
+
+        let usable = bounds.width - margin * 2 - gutter * CGFloat(columns - 1)
+        guard usable > 0 else { return }
+        let columnWidth = usable / CGFloat(columns)
+
+        color.withAlphaComponent(color.alphaComponent * 0.55).setFill()
+        var x = margin
+        for _ in 0..<columns {
+            NSRect(x: x, y: 0, width: columnWidth, height: bounds.height).fill()
+            x += columnWidth + gutter
+        }
+
+        let baseline = CGFloat(settings.gridBaseline)
+        guard baseline >= 2 else { return }
+        color.withAlphaComponent(color.alphaComponent * 0.5).setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = 0.5
+        var y = bounds.height
+        while y >= 0 {
+            path.move(to: NSPoint(x: 0, y: y))
+            path.line(to: NSPoint(x: bounds.width, y: y))
+            y -= baseline
+        }
+        path.stroke()
+    }
+
+    // MARK: Guides
+
+    private func drawGuides() {
+        guard !guides.isEmpty else { return }
+        let frame = windowFrame
+        NSColor.systemTeal.withAlphaComponent(0.85).setFill()
+        for guide in guides.guides {
+            switch guide.orientation {
+            case .vertical:
+                let x = CGFloat(guide.position) - frame.minX
+                guard x >= 0, x <= bounds.width else { continue }
+                NSRect(x: x - 0.5, y: 0, width: 1, height: bounds.height).fill()
+            case .horizontal:
+                let y = CGFloat(guide.position) - frame.minY
+                guard y >= 0, y <= bounds.height else { continue }
+                NSRect(x: 0, y: y - 0.5, width: bounds.width, height: 1).fill()
+            }
+        }
+    }
+
+    // MARK: Crosshair
+
+    private func drawCrosshair() {
+        let frame = windowFrame
+        guard NSMouseInRect(pointer, frame, false) else { return }
+
+        let local = NSPoint(x: pointer.x - frame.minX, y: pointer.y - frame.minY)
         let thickness = max(0.5, CGFloat(settings.crosshairThickness))
-        settings.crosshairNSColor.setFill()
+        let gap = max(0, CGFloat(settings.crosshairGap))
+        let color = settings.crosshairNSColor
 
-        NSRect(x: local.x - thickness / 2, y: 0,
-               width: thickness, height: bounds.height).fill()
-        NSRect(x: 0, y: local.y - thickness / 2,
-               width: bounds.width, height: thickness).fill()
+        if settings.crosshairDashed {
+            color.setStroke()
+            let path = NSBezierPath()
+            path.lineWidth = thickness
+            path.setLineDash([6, 4], count: 2, phase: 0)
+            if gap > 0 {
+                path.move(to: NSPoint(x: local.x, y: 0))
+                path.line(to: NSPoint(x: local.x, y: local.y - gap))
+                path.move(to: NSPoint(x: local.x, y: local.y + gap))
+                path.line(to: NSPoint(x: local.x, y: bounds.height))
+                path.move(to: NSPoint(x: 0, y: local.y))
+                path.line(to: NSPoint(x: local.x - gap, y: local.y))
+                path.move(to: NSPoint(x: local.x + gap, y: local.y))
+                path.line(to: NSPoint(x: bounds.width, y: local.y))
+            } else {
+                path.move(to: NSPoint(x: local.x, y: 0))
+                path.line(to: NSPoint(x: local.x, y: bounds.height))
+                path.move(to: NSPoint(x: 0, y: local.y))
+                path.line(to: NSPoint(x: bounds.width, y: local.y))
+            }
+            path.stroke()
+        } else {
+            color.setFill()
+            if gap > 0 {
+                NSRect(x: local.x - thickness / 2, y: 0,
+                       width: thickness, height: max(0, local.y - gap)).fill()
+                NSRect(x: local.x - thickness / 2, y: local.y + gap,
+                       width: thickness, height: max(0, bounds.height - local.y - gap)).fill()
+                NSRect(x: 0, y: local.y - thickness / 2,
+                       width: max(0, local.x - gap), height: thickness).fill()
+                NSRect(x: local.x + gap, y: local.y - thickness / 2,
+                       width: max(0, bounds.width - local.x - gap), height: thickness).fill()
+            } else {
+                NSRect(x: local.x - thickness / 2, y: 0,
+                       width: thickness, height: bounds.height).fill()
+                NSRect(x: 0, y: local.y - thickness / 2,
+                       width: bounds.width, height: thickness).fill()
+            }
+        }
 
         if settings.showCoordinates {
             drawReadout(at: local)
